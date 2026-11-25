@@ -1,19 +1,25 @@
 use anyhow::{Context, Result, bail};
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
-pub fn start(dir: Option<PathBuf>) -> Result<()> {
-    run(dir, Action::Start)
+pub fn start(dir: Option<PathBuf>, timeout: u64) -> Result<()> {
+    run(dir, Action::Start(timeout))
 }
 pub fn stop(dir: Option<PathBuf>) -> Result<()> {
     run(dir, Action::Stop)
 }
-pub fn restart(dir: Option<PathBuf>) -> Result<()> {
-    run(dir, Action::Restart)
+pub fn restart(dir: Option<PathBuf>, timeout: u64) -> Result<()> {
+    run(dir, Action::Restart(timeout))
 }
+/// Prepare only a local, mset-managed instance; remote controllers never call this.
+pub(crate) fn prepare_tun(dir: Option<PathBuf>) -> Result<()> {
+    run(dir, Action::PrepareTun)
+}
+
 enum Action {
-    Start,
+    Start(u64),
     Stop,
-    Restart,
+    Restart(u64),
+    PrepareTun,
 }
 
 #[cfg(not(unix))]
@@ -43,11 +49,13 @@ fn run(dir: Option<PathBuf>, action: Action) -> Result<()> {
     lock.try_lock()
         .context("another mset lifecycle command is running; retry after it finishes")?;
     match action {
-        Action::Start => unix::start(&dir),
+        Action::PrepareTun => unix::prepare_tun(&dir),
+        Action::Start(timeout) => unix::start(&dir, Duration::from_secs(timeout)),
         Action::Stop => unix::stop(&dir),
-        Action::Restart => {
+        Action::Restart(timeout) => {
+            unix::validate(&dir, Duration::from_secs(timeout))?;
             unix::stop(&dir)?;
-            unix::start(&dir)
+            unix::start(&dir, Duration::from_secs(timeout))
         }
     }
 }
@@ -140,27 +148,121 @@ mod unix {
         }
     }
 
-    pub(super) fn start(dir: &Path) -> Result<()> {
-        if let Some((pid, _)) = managed(dir)? {
-            println!("Mihomo is already running (PID {pid}).");
-            return Ok(());
+    pub(super) fn prepare_tun(dir: &Path) -> Result<()> {
+        let process = managed(dir)?.context("no local mset-managed Mihomo is running; run mset start first (external processes are not restarted automatically)")?;
+        #[cfg(target_os = "linux")]
+        {
+            {
+                let (pid, _) = &process;
+                // The PID/birth record already identifies the child launched by mset.
+                // /proc/PID/exe may be unreadable after file capabilities are granted.
+                let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+                let caps = status
+                    .lines()
+                    .find_map(|l| l.strip_prefix("CapEff:"))
+                    .context("cannot determine Mihomo network permissions")?;
+                let caps = u64::from_str_radix(caps.trim(), 16)?;
+                if network_capabilities(caps) {
+                    return Ok(());
+                }
+            }
+            // Authorize before stopping: cancellation or sudo failure leaves the old process running.
+            crate::install::grant_tun(Some(dir.to_path_buf()))?;
+            stop(dir)?;
+            start(dir, Duration::from_secs(30))?;
+            let (pid, _) = managed(dir)?.context("Mihomo did not start")?;
+            let status = fs::read_to_string(format!("/proc/{pid}/status"))?;
+            let caps = status
+                .lines()
+                .find_map(|l| l.strip_prefix("CapEff:"))
+                .context("cannot determine Mihomo network permissions")?;
+            if !network_capabilities(u64::from_str_radix(caps.trim(), 16)?) {
+                bail!(
+                    "Mihomo still lacks TUN permissions after restart; check filesystem mount flags and container capability limits"
+                );
+            }
+            Ok(())
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = process;
+            // Do not elevate an entire core silently on platforms without Linux file capabilities.
+            bail!(
+                "automatic TUN authorization currently supports Linux only; start Mihomo with administrator privileges on this platform"
+            )
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn network_capabilities(caps: u64) -> bool {
+        const REQUIRED: u64 = (1 << 12) | (1 << 13); // CAP_NET_ADMIN | CAP_NET_RAW
+        caps & REQUIRED == REQUIRED
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod capability_tests {
+        use super::*;
+        #[test]
+        fn requires_both_network_capabilities() {
+            assert!(!network_capabilities(0));
+            assert!(!network_capabilities(1 << 12));
+            assert!(!network_capabilities(1 << 13));
+            assert!(network_capabilities((1 << 12) | (1 << 13)));
+        }
+    }
+
+    pub(super) fn validate(dir: &Path, timeout: Duration) -> Result<()> {
         let binary = dir.join("mihomo");
         let config = dir.join("config.yaml");
         if !binary.is_file() || !config.is_file() {
-            bail!("installation incomplete; run mset setup first");
+            bail!(
+                "installation incomplete in {}; run mset setup first",
+                dir.display()
+            );
         }
-        let checked = Command::new(&binary)
+        crate::cfg::read_controller(&config)?;
+        let mut check = Command::new(&binary)
             .arg("-t")
             .arg("-d")
             .arg(dir)
             .arg("-f")
             .arg(&config)
-            .status()
+            .stdin(Stdio::null())
+            .spawn()
             .context("cannot run Mihomo configuration check")?;
-        if !checked.success() {
-            bail!("Mihomo configuration check failed ({checked})");
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = check.try_wait()? {
+                if status.success() {
+                    return Ok(());
+                }
+                bail!(
+                    "Mihomo configuration check failed ({status}); fix {} before starting/restarting",
+                    config.display()
+                );
+            }
+            if Instant::now() >= deadline {
+                let _ = check.kill();
+                let _ = check.wait();
+                bail!(
+                    "configuration check timed out after {} seconds for {}; existing running core was not stopped",
+                    timeout.as_secs(),
+                    config.display()
+                );
+            }
+            thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    pub(super) fn start(dir: &Path, timeout: Duration) -> Result<()> {
+        if let Some((pid, _)) = managed(dir)? {
+            wait_ready(dir, pid, timeout)?;
+            println!("Mihomo is already running and API ready (PID {pid}).");
+            return Ok(());
+        }
+        validate(dir, timeout)?;
+        let binary = dir.join("mihomo");
+        let config = dir.join("config.yaml");
         let log_path = dir.join("mihomo.log");
         let log = OpenOptions::new()
             .create(true)
@@ -216,12 +318,60 @@ mod unix {
             let _ = child.wait();
             return Err(e);
         }
+        if let Err(error) = wait_ready(dir, child.id(), timeout) {
+            if child.try_wait()?.is_some() {
+                let _ = managed(dir)?; // Clear a dead process record.
+                return Err(error.context(format!(
+                    "Mihomo exited during startup; inspect {}",
+                    log_path.display()
+                )));
+            }
+            return Err(error.context(format!("Mihomo process {} remains running but is not ready; inspect {} or run mset stop --dir {:?}", child.id(), log_path.display(), dir)));
+        }
         println!(
-            "Mihomo started in background (PID {}). Log: {}",
+            "Mihomo started in background and API ready (PID {}). Log: {}",
             child.id(),
             log_path.display()
         );
         Ok(())
+    }
+
+    fn wait_ready(dir: &Path, pid: u32, timeout: Duration) -> Result<()> {
+        let c = crate::cfg::client_for_file(&dir.join("config.yaml"), None)?;
+        let deadline = Instant::now() + timeout;
+        let mut last_error: Option<anyhow::Error> = None;
+        loop {
+            if identity(pid)?.is_none() {
+                bail!("Mihomo process {pid} exited before API readiness");
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let message = format!(
+                    "controller API startup timed out after {} seconds",
+                    timeout.as_secs()
+                );
+                if let Some(error) = last_error {
+                    return Err(error).context(message);
+                }
+                bail!("{message}");
+            }
+            match c.configs_timeout(remaining.min(Duration::from_secs(2))) {
+                Ok(_) => return Ok(()),
+                Err(error) if !crate::errors::retryable(&error) => {
+                    return Err(error).context("controller API readiness check failed");
+                }
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(error).context(format!(
+                        "controller API startup timed out after {} seconds",
+                        timeout.as_secs()
+                    ));
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
     }
 
     pub(super) fn stop(dir: &Path) -> Result<()> {
@@ -235,11 +385,13 @@ mod unix {
                 return Err(e).context("cannot stop Mihomo");
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // TUN teardown can take tens of seconds; wait for actual exit rather than
+        // forcing callers to insert a sleep between stop and start.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while identity(pid)?.as_deref() == Some(&birth) {
             if Instant::now() >= deadline {
                 bail!(
-                    "Mihomo did not stop within 10 seconds; PID record retained; restart cancelled"
+                    "Mihomo did not stop within 60 seconds; PID record retained; restart cancelled"
                 );
             }
             thread::sleep(Duration::from_millis(100));

@@ -1,6 +1,6 @@
 [package]
 name = "mihomo_set"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [[bin]]
@@ -16,6 +16,7 @@ unicode-width = "0.2"
 ureq = { version = "2", features = ["json"] }
 urlencoding = "2"
 flate2 = "1"
+serde_yaml_ng = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

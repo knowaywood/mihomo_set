@@ -7,6 +7,7 @@ pub struct Client {
     base: String,
     secret: Option<String>,
     agent: ureq::Agent,
+    config_path: Option<std::path::PathBuf>,
 }
 
 impl Client {
@@ -18,7 +19,57 @@ impl Client {
             base: base.trim_end_matches('/').to_string(),
             secret,
             agent,
+            config_path: None,
         }
+    }
+
+    pub(crate) fn config_path(&self) -> Option<&std::path::Path> {
+        self.config_path.as_deref()
+    }
+
+    pub(crate) fn set_config_path(&mut self, path: std::path::PathBuf) {
+        self.config_path = Some(path);
+    }
+
+    pub(crate) fn persist_patch(&self, body: &Value) -> Result<()> {
+        if let Some(path) = &self.config_path {
+            crate::cfg::Update::prepare(path, body)
+                .and_then(|update| update.commit())
+                .map_err(|error| {
+                    anyhow!(
+                        "runtime changed, but could not save {}: {error:#}",
+                        path.display()
+                    )
+                })?;
+            println!("Saved to {}", path.display());
+        } else {
+            println!(
+                "Runtime only: no matching local configuration file (remote files are not modified)."
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base
+    }
+
+    pub(crate) fn is_local(&self) -> bool {
+        let host = self
+            .base
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&self.base);
+        let authority = host.split('/').next().unwrap_or("");
+        if authority.contains('@') {
+            return false;
+        }
+        authority == "localhost"
+            || authority.starts_with("localhost:")
+            || authority == "127.0.0.1"
+            || authority.starts_with("127.0.0.1:")
+            || authority == "[::1]"
+            || authority.starts_with("[::1]:")
     }
 
     fn req(&self, method: &str, path: &str) -> ureq::Request {
@@ -36,69 +87,111 @@ impl Client {
             .timeout(std::time::Duration::from_secs(60))
     }
 
-    fn status_err(code: u16, resp: ureq::Response) -> anyhow::Error {
-        let text = resp.into_string().unwrap_or_default();
-        let msg = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("HTTP {}", code));
-        anyhow!("{}", msg)
+    pub fn get_json(&self, path: &str) -> Result<Value> {
+        self.get_json_timeout(path, std::time::Duration::from_secs(60))
     }
 
-    pub fn get_json(&self, path: &str) -> Result<Value> {
-        match self.json_req("GET", path).call() {
-            Ok(r) => Ok(r.into_json()?),
-            Err(ureq::Error::Status(code, r)) => Err(Self::status_err(code, r)),
-            Err(e) => Err(anyhow!("{}", e)),
-        }
+    fn get_json_timeout(&self, path: &str, timeout: std::time::Duration) -> Result<Value> {
+        let response = self
+            .req("GET", path)
+            .timeout(timeout)
+            .call()
+            .map_err(|e| crate::errors::request_error("GET", path, e))?;
+        response.into_json().map_err(|error| {
+            let timeout = matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            );
+            crate::errors::ApiError {
+                kind: if timeout {
+                    crate::errors::ApiKind::Timeout
+                } else {
+                    crate::errors::ApiKind::Protocol
+                },
+                status: None,
+                operation: crate::errors::operation("GET", path),
+                detail: if timeout {
+                    "while reading response body"
+                } else {
+                    "expected valid JSON"
+                }
+                .into(),
+            }
+            .into()
+        })
     }
 
     pub fn put_json(&self, path: &str, body: Value) -> Result<()> {
-        match self.json_req("PUT", path).send_json(body) {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(code, r)) => Err(Self::status_err(code, r)),
-            Err(e) => Err(anyhow!("{}", e)),
-        }
+        self.json_req("PUT", path)
+            .send_json(body)
+            .map(|_| ())
+            .map_err(|e| crate::errors::request_error("PUT", path, e))
     }
-
     pub fn patch_json(&self, path: &str, body: Value) -> Result<()> {
-        match self.json_req("PATCH", path).send_json(body) {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(code, r)) => Err(Self::status_err(code, r)),
-            Err(e) => Err(anyhow!("{}", e)),
-        }
+        self.json_req("PATCH", path)
+            .send_json(body)
+            .map(|_| ())
+            .map_err(|e| crate::errors::request_error("PATCH", path, e))
     }
-
     pub fn post_json(&self, path: &str) -> Result<()> {
-        match self.json_req("POST", path).send_json(json!({})) {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(code, r)) => Err(Self::status_err(code, r)),
-            Err(e) => Err(anyhow!("{}", e)),
-        }
+        self.json_req("POST", path)
+            .send_json(json!({}))
+            .map(|_| ())
+            .map_err(|e| crate::errors::request_error("POST", path, e))
     }
-
     pub fn delete(&self, path: &str) -> Result<()> {
-        match self.json_req("DELETE", path).call() {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(code, r)) => Err(Self::status_err(code, r)),
-            Err(e) => Err(anyhow!("{}", e)),
-        }
+        self.json_req("DELETE", path)
+            .call()
+            .map(|_| ())
+            .map_err(|e| crate::errors::request_error("DELETE", path, e))
     }
-
     pub fn stream(&self, path: &str) -> Result<Box<dyn Read + Send>> {
-        match self.req("GET", path).call() {
-            Ok(r) => Ok(Box::new(r.into_reader())),
-            Err(ureq::Error::Status(code, r)) => Err(Self::status_err(code, r)),
-            Err(e) => Err(anyhow!("{}", e)),
-        }
+        let response = self
+            .req("GET", path)
+            .call()
+            .map_err(|e| crate::errors::request_error("GET", path, e))?;
+        Ok(Box::new(response.into_reader()))
     }
 
     pub fn configs(&self) -> Result<Value> {
-        self.get_json("/configs")
+        self.configs_timeout(std::time::Duration::from_secs(5))
+    }
+
+    pub(crate) fn configs_timeout(&self, timeout: std::time::Duration) -> Result<Value> {
+        let config = self.get_json_timeout("/configs", timeout)?;
+        if config.get("mode").and_then(Value::as_str).is_none() {
+            return Err(crate::errors::ApiError {
+                kind: crate::errors::ApiKind::Protocol,
+                status: None,
+                operation: "GET /configs".into(),
+                detail: "response is not a Mihomo configuration".into(),
+            }
+            .into());
+        }
+        Ok(config)
     }
 
     pub fn patch_configs(&self, body: Value) -> Result<()> {
+        let pending = self
+            .config_path
+            .as_ref()
+            .map(|path| crate::cfg::Update::prepare(path, &body))
+            .transpose()?;
+        self.patch_json("/configs", body)?;
+        if let Some(update) = pending {
+            update.commit()?;
+            if let Some(path) = &self.config_path {
+                println!("Saved to {}", path.display());
+            }
+        } else {
+            println!(
+                "Runtime only: no matching local configuration file (remote files are not modified)."
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn patch_configs_runtime(&self, body: Value) -> Result<()> {
         self.patch_json("/configs", body)
     }
 
@@ -111,6 +204,27 @@ impl Client {
     }
 
     pub fn select(&self, group: &str, node: &str) -> Result<()> {
+        if let Some(path) = &self.config_path {
+            if !crate::cfg::selection_cache_enabled(path)? {
+                crate::cfg::Update::prepare(path, &json!({"profile":{"store-selected":true}}))?
+                    .commit()?;
+                if let Err(error) = self.reload("") {
+                    if let Err(rollback) = crate::cfg::Update::prepare(
+                        path,
+                        &json!({"profile":{"store-selected":false}}),
+                    )
+                    .and_then(|update| update.commit())
+                    {
+                        return Err(anyhow!(
+                            "could not activate node caching: {error:#}; also could not restore configuration: {rollback:#}"
+                        ));
+                    }
+                    return Err(anyhow!(
+                        "could not activate node caching; configuration restored, node was not changed: {error:#}"
+                    ));
+                }
+            }
+        }
         self.put_json(
             &format!("/proxies/{}", encode(group)),
             json!({ "name": node }),
@@ -222,5 +336,27 @@ impl Client {
             (None, None) => a.0.cmp(&b.0),
         });
         v
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+    #[test]
+    fn local_inspection_is_only_for_loopback_controllers() {
+        for url in [
+            "http://localhost:9090",
+            "http://127.0.0.1:9090",
+            "http://[::1]:9090",
+        ] {
+            assert!(Client::new(url.into(), None).is_local());
+        }
+        for url in [
+            "http://192.168.1.2:9090",
+            "http://localhost.example:9090",
+            "http://localhost:9090@example.org",
+        ] {
+            assert!(!Client::new(url.into(), None).is_local());
+        }
     }
 }

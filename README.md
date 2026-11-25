@@ -25,7 +25,7 @@ Run this in Bash or Zsh on Linux/macOS:
 
 ```bash
 repo='knowaywood/mihomo_set'
-version='v0.1.0'
+version='v0.1.1'
 platform='linux-x86_64'
 archive="mset-${version}-${platform}"
 
@@ -95,7 +95,7 @@ mset start --dir ./mihomo-local
 
 # Tell management commands where to find a configuration in a custom directory
 export MIHOMO_CONFIG="$PWD/mihomo-local/config.yaml"
-mset now
+mset status
 ```
 
 `setup` preserves existing binaries and configuration files. Use a different directory to install another copy. Failed downloads can be retried. `start` validates the configuration before launching in the background; it does not configure startup at boot. Configuration files are created with owner-only read/write permissions.
@@ -106,7 +106,7 @@ If `--secret` is omitted, setup reads `MIHOMO_SECRET`; if neither is provided, i
 
 ```bash
 mset --help
-mset now
+mset status
 mset test
 mset best
 mset mode rule
@@ -117,7 +117,9 @@ mset reload
 
 `mset test` and `mset best` default to the `PROXY` group. To use another group, run `mset test -g Media` or `mset best -g Media`. If `PROXY` does not exist in your configuration, specify the actual group name with `-g`.
 
-Runtime changes made through the API are not written back to the configuration file by this tool. For persistent changes, edit `config.yaml` and reload it.
+When the controller matches a local configuration file, `tun on/off`, `mode`, and `set` changes are saved to that file and survive `reload` and `restart`. Other YAML fields are preserved. Each save backs up the exact previous file to `<config>.bak`, writes with owner-only permissions, and atomically replaces the configuration. YAML formatting, comments, and anchor layout may be normalized; the previous text is available in the backup. API failures do not commit file changes.
+
+Remote controllers or controllers without a matching local file remain runtime-only and print a notice. Explicitly reloading a different file uses that file's settings. Configuration is parsed as YAML, including quoted/escaped secrets, inline comments, and merge keys; malformed YAML reports an error instead of silently using another controller. Automatic discovery skips files with no enabled `external-controller` (for example, an old file containing only `mixed-port`) and continues to the next candidate. An explicit `MIHOMO_CONFIG` or `--dir` configuration is validated strictly.
 
 ## Node selection
 
@@ -128,22 +130,90 @@ The tool prefers the `PROXY` group created by setup. If there is only one manual
 `mset use 3` selects the third node in the last saved latency test ranking; numbers entered in the interactive menu refer to the current menu instead.
 You can also run `mset best` to test nodes and select the fastest automatically.
 
+Node selections use Mihomo's native `profile.store-selected` cache and are restored on reload/restart while the node still exists. Setup enables this by default. For an existing matching local configuration without caching, the first selection enables it and reloads the configuration once before changing the node. Remote controllers need their own selection cache configured.
+
+### Test results and status information
+
+```bash
+mset test       # Show latency rankings, routing mode, and TUN/device status, then exit
+mset use 3      # Select the third node from the last test ranking
+mset tun on    # Enable TUN
+mset tun off   # Disable TUN
+mset mode rule # Use rule-based routing (also supports global/direct)
+```
+
+`mset test` always includes mode and TUN information, without additional flags or input prompts. It returns to the shell immediately after displaying results. The former `-i`/`--interactive` option has been removed.
+
+`mset use` without a node still opens the node menu, where `t` toggles TUN and `r/g/d` switches routing modes. TUN is a traffic capture method; rule/global/direct controls routing. Disabling TUN leaves HTTP/SOCKS available and does not configure the system proxy. In global mode, traffic follows the `GLOBAL` group's selection.
+
 ## Background process management
 
 ```bash
 mset start     # Start in the background; do not launch a duplicate instance
-mset stop      # Request a graceful shutdown and wait up to 10 seconds
+mset stop      # Request a graceful shutdown and wait up to 60 seconds
 mset restart   # Wait for shutdown, validate the configuration, and start again
 ```
 
 For a custom installation directory, pass the same `--dir` to all three commands.
 Logs are written to `mihomo.log` in the installation directory, and the process record is stored in `mihomo.pid`.
 The background process runs independently of the terminal and continues after it closes. Startup at boot is not configured.
-The start command detects immediate startup failures, but does not guarantee that subscriptions have finished loading.
+The start command checks both process liveness and API readiness before reporting success. The default startup timeout is 30 seconds; use `mset start --timeout 60` or `mset restart --timeout 60` to change it. An API failure reports the cause and log path; a still-running process keeps its PID record so `mset stop` can manage it. API readiness does not guarantee that subscriptions have finished loading.
 
 `stop` and `restart` only manage instances launched and recorded by the current background-capable `mset start`. They do not stop Mihomo instances started manually or managed by systemd or other tools.
 If you are upgrading from the earlier foreground version, stop the old process with Ctrl+C in its original terminal before starting the new version.
-If shutdown times out, the process record is retained and restart does not launch a second instance.
+Shutdown waits for the process to exit, for up to 60 seconds, to allow time for TUN cleanup. It returns as soon as the process exits; no manual sleep is needed between stop and start. If shutdown times out, the process record is retained and restart does not launch a second instance.
+
+## TUN control
+
+With Mihomo running, use a single command:
+
+```bash
+mset tun on    # Authorize and restart if needed, then enable TUN
+mset tun off   # Disable TUN
+mset tun       # Show TUN configuration and device inspection
+```
+
+Use `mset status` to show mode, TUN/device status, and the current node of each group. For example:
+
+```text
+Mode: rule
+TUN configured: on
+TUN device: Meta (Linux TUN, UP; ownership/routes not verified)
+```
+
+For a loopback API on Linux, the tool reads the named device's kernel TUN flags and interface UP flag. A missing device is reported separately even when configuration says TUN is on. Missing API fields remain unknown. Remote APIs and other operating systems show configuration without claiming that a local device was verified. Loopback forwarding into a container may use a different network namespace; a missing host device does not prove that the remote core failed. Device existence does not establish ownership or prove that traffic is routed through it. No devices or routes are removed by these checks.
+
+On Linux, `tun on` checks the running core's network capabilities. For a local instance managed by `mset start`, it automatically runs sudo/setcap and restarts the core only if permissions are missing, waits for the API, and enables TUN with automatic routing and interface detection. If permissions already exist, it enables TUN without restarting. If TUN is already configured on and the matching local device is a TUN interface marked UP, it keeps the existing device. If the device is missing, down, or the wrong type, it attempts to recreate it. Sudo may prompt for your password on first use.
+
+For a custom installation directory, run `mset tun on --dir ./mihomo-local`. The command reads the controller address and secret from that directory's configuration.
+
+Automatic authorization requires `setcap`, a filesystem supporting file capabilities, and access to the TUN device. Containers must allow the required capabilities. An explicit `--api`, `MIHOMO_API`, or a custom `MIHOMO_CONFIG` without `--dir` uses API-only control and never authorizes or restarts a local core. External supervisors are not managed automatically. macOS still requires the core to be started with administrator privileges; automatic authorization/restart is Linux-only.
+
+For a matching local configuration, the TUN switch is saved to `config.yaml` and survives reloads and restarts. On local Linux, enabling TUN waits for a matching TUN interface to become UP; if this fails, the command reports an error, resets the runtime switch to off, and does not save the failed enable. Remote and non-Linux controllers cannot be verified using local Linux device inspection, so their device status remains unverified.
+
+Existing DNS and device settings are preserved; this command does not add DNS hijacking or configure a resolver. An UP device still does not prove route ownership or end-to-end connectivity. Check `mihomo.log` if traffic is not routed as expected.
+
+## Errors and verification
+
+API errors identify authentication failures (401), denied access (403), missing resources (404), server errors (5xx), connection failures, timeouts, and malformed responses. Authentication, connection, or protocol errors from `tun on` never trigger local authorization or a restart. Invalid YAML and file permission errors include relevant configuration/path context. Request query strings and credentials are omitted from API error diagnostics.
+
+Run the automated checks after building:
+
+```bash
+cargo test --locked
+cargo build --release --locked
+python3 tests/configuration.py
+python3 tests/lifecycle.py
+```
+
+For real Linux TUN testing, `tests/tun_system.py` requires a real Mihomo binary (default `/usr/local/bin/mihomo`), `/dev/net/tun`, iproute2, and user/network/mount namespaces. It runs in a fresh namespace, uses no subscription or external network, and checks TUN type/UP state, route selection, native node caching, reload/restart, and link/IPv4/IPv6 route/rule restoration after disabling TUN or stopping the core:
+
+```bash
+unshare --user --map-root-user --net --mount --propagation private sh -eu -c \
+  'mount -t sysfs sysfs /sys; MSET_ISOLATED_TEST=1 python3 tests/tun_system.py'
+```
+
+This verifies local routing and teardown in isolation; it does not measure external proxy connectivity or prove cleanup for every kernel/network configuration. It does not delete host routes or devices.
 
 ## Publish a release
 
@@ -151,12 +221,12 @@ If shutdown times out, the process record is retained and restart does not launc
 Only a pushed `v*` tag creates a GitHub Release and uploads the four archives plus `SHA256SUMS`. Versions containing `-` are marked as prereleases. Each archive includes both the English and Chinese READMEs.
 
 1. Update `version` in `Cargo.toml`, run `cargo check` to update `Cargo.lock`, and commit the code and workflow.
-2. Push the commit, then create and push a tag matching the package version. For the current version, `0.1.0`:
+2. Push the commit, then create and push a tag matching the package version. For the current version, `0.1.1`:
 
    ```bash
    git push
-   git tag -a v0.1.0 -m 'Release v0.1.0'
-   git push origin v0.1.0
+   git tag -a v0.1.1 -m 'Release v0.1.1'
+   git push origin v0.1.1
    ```
 
 3. Check `CI and Release` in the repository's Actions tab. After it succeeds, download the packages from Releases.

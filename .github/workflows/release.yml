@@ -95,6 +95,7 @@ jobs:
         run: |
           "$MSET_BINARY" --version
           python3 tests/lifecycle.py
+          python3 tests/configuration.py
       - name: Package binary and documentation
         run: |
           version=$(python3 -c 'import json, subprocess; print(json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]))["packages"][0]["version"])')

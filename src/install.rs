@@ -36,7 +36,7 @@ fn config(subscription: Option<&str>, port: u16, secret: &str) -> Result<String>
         bail!("proxy port must differ from controller port 9090");
     }
     let mut text = format!(
-        "mixed-port: {port}\nallow-lan: false\nmode: rule\nlog-level: info\nexternal-controller: 127.0.0.1:9090\nsecret: {}\n",
+        "mixed-port: {port}\nallow-lan: false\nmode: rule\nlog-level: info\nprofile:\n  store-selected: true\nexternal-controller: 127.0.0.1:9090\nsecret: {}\n",
         serde_json::to_string(secret)?
     );
     if let Some(url) = subscription {
@@ -150,6 +150,49 @@ pub fn setup(
         println!("No subscription supplied: configuration uses DIRECT only.");
     }
     Ok(())
+}
+
+/// Authorize only the selected Mihomo binary; never run a shell or elevate mset itself.
+pub(crate) fn grant_tun(dir: Option<PathBuf>) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::Command;
+        let binary = directory(dir)?
+            .join("mihomo")
+            .canonicalize()
+            .context("Mihomo is not installed in this directory; run mset setup first")?;
+        if !binary.is_file() {
+            bail!("Mihomo binary is not a regular file");
+        }
+        // Resolve HOME as the invoking user before asking sudo to run setcap.
+        let mut command = if unsafe { libc::geteuid() } == 0 {
+            Command::new("setcap")
+        } else {
+            let mut command = Command::new("sudo");
+            command.arg("--").arg("setcap");
+            command
+        };
+        println!(
+            "Granting TUN permissions to {} (sudo may ask for your password)...",
+            binary.display()
+        );
+        let status = command.arg("cap_net_admin,cap_net_raw=+ep").arg(&binary).status()
+            .context("cannot run setcap; ensure setcap (libcap2-bin on Debian/Ubuntu) and sudo are installed")?;
+        if !status.success() {
+            bail!(
+                "TUN authorization failed ({status}); check sudo permissions and filesystem support for file capabilities"
+            );
+        }
+        println!("TUN permissions granted.");
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        bail!(
+            "automatic TUN authorization supports Linux only; on macOS the core must be started with administrator privileges"
+        )
+    }
 }
 
 #[cfg(test)]

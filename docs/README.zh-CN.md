@@ -25,7 +25,7 @@ Linux 发布包使用 musl 构建，避免依赖目标电脑的 glibc 版本。
 
 ```bash
 repo='knowaywood/mihomo_set'
-version='v0.1.0'
+version='v0.1.1'
 platform='linux-x86_64'
 archive="mset-${version}-${platform}"
 
@@ -94,7 +94,7 @@ mset start --dir ./mihomo-local
 
 # 自定义目录的配置需显式告知后续管理命令
 export MIHOMO_CONFIG="$PWD/mihomo-local/config.yaml"
-mset now
+mset status
 ```
 
 `setup` 不覆盖已有内核或配置；需要重新安装时使用新目录。下载失败可以重试。`start` 先运行内核配置校验，再后台启动；不会设置开机自启。配置文件以仅当前用户可读写的权限创建。
@@ -105,7 +105,7 @@ mset now
 
 ```bash
 mset --help
-mset now
+mset status
 mset test
 mset best
 mset mode rule
@@ -116,7 +116,9 @@ mset reload
 
 `mset test` 和 `mset best` 默认使用 `PROXY` 代理组，无需填写 `-g PROXY`。需要其他组时使用 `mset test -g Media` 或 `mset best -g Media`。若配置中没有 `PROXY`，请通过 `-g` 指定实际组名。
 
-通过 API 修改的运行参数不会由本工具写回配置文件。持久修改请编辑 `config.yaml` 后重新加载。
+控制地址与本地配置文件匹配时，`tun on/off`、`mode` 和 `set` 的修改会保存到该文件，`reload`、`restart` 后仍然保留，其他 YAML 配置字段保持不变。保存前将原文件完整备份到 `<配置文件>.bak`，以仅当前用户可读写的权限写入，并原子替换配置。YAML 格式、注释和锚点布局可能被规范化，原始文本可从备份中找回；API 请求失败不会提交文件修改。
+
+远程控制器或找不到匹配本地配置时仅修改运行状态，并明确提示。显式重载其他文件时，以新文件的设置为准。配置读取使用 YAML 解析，支持密钥引号/转义、行尾注释和合并键；格式错误会直接报错，不会静默连接其他控制器。自动查找时会跳过没有启用 `external-controller` 的文件（例如只有 `mixed-port` 的旧配置），继续检查后续候选；通过 `MIHOMO_CONFIG` 或 `--dir` 显式指定的配置仍严格校验。
 
 ## 简化节点选择
 
@@ -128,22 +130,90 @@ mset reload
 `mset use 3` 保留原含义：选择上次测速排名第三的节点；菜单中的序号则对应当前菜单。
 也可运行 `mset best` 测速并自动选节点。
 
+节点选择使用 Mihomo 原生的 `profile.store-selected` 缓存，在节点仍存在时可跨重载、重启恢复。初始化配置默认启用该选项；已有匹配的本地配置未启用时，首次选择节点会启用缓存并重新加载一次配置，再切换节点。远程控制器需要自行启用其节点缓存。
+
+### 测速结果与状态信息
+
+```bash
+mset test       # 显示测速排名、路由模式、TUN/网卡状态后直接结束
+mset use 3      # 选择上次测速排名第三的节点
+mset tun on    # 开启 TUN
+mset tun off   # 关闭 TUN
+mset mode rule # 使用规则模式，也支持 global/direct
+```
+
+`mset test` 默认附带模式和 TUN 信息，不需要额外参数，也不会等待输入。显示结果后直接返回终端，原来的 `-i`/`--interactive` 参数已移除。
+
+不带节点参数的 `mset use` 仍会打开节点菜单，支持 `t` 开关 TUN、`r/g/d` 切换路由模式。TUN 是流量接管方式，rule/global/direct 是路由模式。关闭 TUN 后仍可使用 HTTP/SOCKS，但工具不会自动配置系统代理；global 模式由 `GLOBAL` 组的选择决定。
+
 ## 后台进程管理
 
 ```bash
 mset start     # 后台启动，已运行时不会重复启动
-mset stop      # 正常关闭 Mihomo，最多等待 10 秒
+mset stop      # 正常关闭 Mihomo，最多等待 60 秒
 mset restart   # 等待旧进程退出，再重新校验配置、后台启动
 ```
 
 自定义安装目录时，三个命令均需使用相同的 `--dir`。
 日志写入安装目录的 `mihomo.log`，进程记录为 `mihomo.pid`。
 后台进程脱离终端，关闭终端后继续运行；不提供开机自启。
-启动命令会检测立即退出的启动错误，但不保证订阅已加载完成。
+启动命令会同时检查进程存活和 API 就绪，确认后才报告成功。默认等待 30 秒，可用 `mset start --timeout 60` 或 `mset restart --timeout 60` 调整。API 失败会说明原因和日志路径；仍在运行的进程保留 PID 记录，便于执行 `mset stop` 管理。API 就绪不代表订阅已全部加载完成。
 `stop` 和 `restart` 只管理由新版 `mset start` 启动并记录的实例，
 不会关闭手动启动或 systemd 等其他工具管理的 Mihomo。
 旧版前台启动的进程请先在原终端 Ctrl+C 关闭，再使用新版启动。
-停止超时会保留进程记录，restart 不会继续启动第二个实例。
+关闭时最多等待 60 秒，为 TUN 清理留出时间；进程退出后立即继续，无需手动加 sleep。停止超时会保留进程记录，restart 不会继续启动第二个实例。
+
+## TUN 开关
+
+Mihomo 已运行时，只需一条命令：
+
+```bash
+mset tun on    # 按需自动授权、重启，然后开启 TUN
+mset tun off   # 关闭 TUN
+mset tun       # 查看 TUN 配置和实际网卡检查结果
+```
+
+`mset status` 统一显示运行模式、TUN/网卡状态和各代理组的当前节点。例如：
+
+```text
+Mode: rule
+TUN configured: on
+TUN device: Meta (Linux TUN, UP; ownership/routes not verified)
+```
+
+Linux 下连接回环 API 时，工具会读取对应网卡的内核 TUN 类型标记和 UP 标记。即使配置显示已开启，网卡不存在也会单独提示；API 未报告的字段显示未知。远程 API 和其他操作系统只展示配置，不声称已验证本地网卡。如果回环地址通过端口映射连接容器，网卡可能在不同网络命名空间中，本机未找到网卡不代表容器内核失败。网卡存在也不等于确认其归属或流量已接管，检查不会删除任何网卡或路由。
+
+Linux 下，`tun on` 会检查运行中内核的网络权限。对于 `mset start` 管理的本地实例，缺少权限时自动调用 sudo/setcap 授权并重启，等待 API 就绪后开启 TUN、自动配置路由和检测出口网卡；已有权限时直接开启，不重启。若 API 配置已开启且本地对应设备确实是 UP 状态的 TUN，则保留现有设备；设备缺失、未启用或类型不符时，会尝试重新创建。首次授权时可能提示输入 sudo 密码。
+
+自定义安装目录使用 `mset tun on --dir ./mihomo-local`，命令会读取该目录配置中的控制地址和密钥。
+
+自动授权需要系统安装 `setcap`，文件系统支持文件能力，并允许访问 TUN 设备；容器还需允许相关网络权限。显式指定 `--api`、`MIHOMO_API`，或单独设置 `MIHOMO_CONFIG` 而未指定 `--dir` 时，仅通过 API 切换，不会授权或重启本地内核。其他工具管理的实例不会被自动重启。macOS 仍需以管理员权限启动内核，自动授权和重启仅支持 Linux。
+
+匹配本地配置时，TUN 开关会保存到 `config.yaml`，重载和重启后保留。Linux 本地开启时会等待对应设备确实成为 UP 状态的 TUN；失败则报错、将运行开关恢复为关闭，并且不保存这次失败的开启操作。远程控制器和非 Linux 系统无法通过本地 Linux 网卡检查验证，设备状态会注明未验证。
+
+命令保留已有 DNS 和设备配置，不额外配置 DNS 劫持或解析器。网卡 UP 仍不代表已确认路由归属或端到端连通性；流量异常时请检查 `mihomo.log`。
+
+## 报错与验证
+
+API 报错会区分认证失败（401）、访问被拒绝（403）、接口或资源不存在（404）、服务端异常（5xx）、连接失败、超时和响应格式错误。`tun on` 遇到认证、连接或协议错误时不会触发本地授权、重启。YAML 格式和文件权限错误会带上相应的配置或路径信息，API 错误诊断不输出请求查询参数或凭据。
+
+构建后可运行：
+
+```bash
+cargo test --locked
+cargo build --release --locked
+python3 tests/configuration.py
+python3 tests/lifecycle.py
+```
+
+真实 Linux TUN 验证脚本为 `tests/tun_system.py`，需要真实 Mihomo 内核（默认 `/usr/local/bin/mihomo`）、`/dev/net/tun`、iproute2 以及用户/网络/挂载命名空间支持。脚本在独立命名空间内运行，不使用订阅或外网，检查 TUN 类型/UP 状态、路由选择、原生节点缓存、重载/重启，以及关闭 TUN 和停止内核后网卡、IPv4/IPv6 路由、策略规则是否恢复原状：
+
+```bash
+unshare --user --map-root-user --net --mount --propagation private sh -eu -c \
+  'mount -t sysfs sysfs /sys; MSET_ISOLATED_TEST=1 python3 tests/tun_system.py'
+```
+
+该测试验证隔离环境中的本地路由和清理，不测外部代理连通性，也不能保证所有内核/网络配置都已覆盖；不会删除主机路由或网卡。
 
 ## 发布新版本
 
@@ -151,12 +221,12 @@ mset restart   # 等待旧进程退出，再重新校验配置、后台启动
 只有推送 `v*` 标签才自动创建 GitHub Release，并上传四个压缩包及 `SHA256SUMS`；包含 `-` 的版本号标记为预发布。每个压缩包均包含中英文 README。
 
 1. 更新 `Cargo.toml` 的 `version`，执行 `cargo check` 更新 `Cargo.lock`，提交代码及工作流。
-2. 推送提交，再创建并推送与包版本一致的标签。例如当前版本 `0.1.0`：
+2. 推送提交，再创建并推送与包版本一致的标签。例如当前版本 `0.1.1`：
 
    ```bash
    git push
-   git tag -a v0.1.0 -m 'Release v0.1.0'
-   git push origin v0.1.0
+   git tag -a v0.1.1 -m 'Release v0.1.1'
+   git push origin v0.1.1
    ```
 
 3. 在 GitHub 的 Actions 页面查看 `CI and Release`，全部通过后在 Releases 页面下载安装包。

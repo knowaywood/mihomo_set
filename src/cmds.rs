@@ -1,5 +1,5 @@
 use crate::api::Client;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use colored::{ColoredString, Colorize};
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -272,7 +272,12 @@ fn smart_select(c: &Client, map: &Map<String, Value>, node: &str) -> Result<()> 
     Ok(())
 }
 
-pub fn use_node(c: &Client, group: Option<&str>, node: Option<&str>) -> Result<()> {
+pub fn use_node(
+    c: &Client,
+    group: Option<&str>,
+    node: Option<&str>,
+    controls: &crate::ui::Controls,
+) -> Result<()> {
     let (map, _) = load_proxies(c)?;
     let Some(node) = node else {
         let groups = selector_groups(&map, None);
@@ -291,7 +296,9 @@ pub fn use_node(c: &Client, group: Option<&str>, node: Option<&str>) -> Result<(
             selected_group,
             info["now"].as_str().unwrap_or("-")
         );
-        let target = prompt_choice("node", &group_nodes(info))?;
+        let Some(target) = crate::ui::choose_node(c, controls, &group_nodes(info), true)? else {
+            return Ok(());
+        };
         if group.is_some() {
             c.select(&selected_group, &target)?;
             println!("{selected_group} → {target}");
@@ -347,7 +354,8 @@ pub fn use_node(c: &Client, group: Option<&str>, node: Option<&str>) -> Result<(
     Ok(())
 }
 
-pub fn current(c: &Client) -> Result<()> {
+pub fn status(c: &Client) -> Result<()> {
+    crate::tun::status(c)?;
     let (map, _) = load_proxies(c)?;
     for (name, info) in &map {
         if info.get("all").is_none() {
@@ -455,6 +463,49 @@ pub fn test(c: &Client, group: Option<&str>, url: &str, timeout: u64, best: bool
     Ok(())
 }
 
+fn tun_patch(enabled: bool) -> Value {
+    if enabled {
+        json!({"tun": {"enable": true, "auto-route": true, "auto-detect-interface": true}})
+    } else {
+        json!({"tun": {"enable": false}})
+    }
+}
+
+pub fn tun(c: &Client, enabled: Option<bool>) -> Result<()> {
+    if let Some(enabled) = enabled {
+        c.patch_configs_runtime(tun_patch(enabled))
+            .context("failed to apply TUN setting")?;
+    }
+    let mut config = c.configs()?;
+    let enabled_now = config
+        .get("tun")
+        .and_then(|t| t.get("enable"))
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("Mihomo did not report TUN status; check its version and logs"))?;
+    if enabled.is_some_and(|wanted| wanted != enabled_now) {
+        bail!("Mihomo did not apply the requested TUN state; configuration was not saved");
+    }
+    if enabled == Some(true) {
+        match crate::tun::verify_enabled(c, &config) {
+            Ok(verified) => config = verified,
+            Err(error) => {
+                // A failed enable must not leave a misleading configured-on state behind.
+                if let Err(rollback) = c.patch_configs_runtime(tun_patch(false)) {
+                    return Err(error.context(format!(
+                        "also failed to reset TUN after enable failure: {rollback:#}"
+                    )));
+                }
+                return Err(error);
+            }
+        }
+    }
+    if let Some(enabled) = enabled {
+        c.persist_patch(&tun_patch(enabled))?;
+    }
+    crate::tun::print_status(c, &config);
+    Ok(())
+}
+
 pub fn mode(c: &Client, m: Option<&str>) -> Result<()> {
     match m {
         None => {
@@ -485,13 +536,6 @@ fn parse_bool(s: &str) -> Result<bool> {
 pub fn set(c: &Client, key: &str, value: &str) -> Result<()> {
     let key = key.to_lowercase();
     let body = match key.as_str() {
-        "mode" => {
-            let m = value.to_lowercase();
-            if !matches!(m.as_str(), "rule" | "global" | "direct") {
-                bail!("mode must be rule / global / direct");
-            }
-            json!({ "mode": m })
-        }
         "log-level" => {
             let m = value.to_lowercase();
             if !matches!(
@@ -512,7 +556,7 @@ pub fn set(c: &Client, key: &str, value: &str) -> Result<()> {
             Value::Object(o)
         }
         _ => bail!(
-            "unsupported key: {}\nsupported: mode, log-level, allow-lan, port, socks-port, mixed-port, redir-port, tproxy-port",
+            "unsupported key: {}\nsupported: log-level, allow-lan, port, socks-port, mixed-port, redir-port, tproxy-port",
             key
         ),
     };
@@ -757,5 +801,37 @@ mod selection_tests {
         assert_eq!(default_group(&["Media", "Work"]), None);
         assert_eq!(default_group(&["Work"]), Some("Work"));
         assert_eq!(default_group(&["GLOBAL", "PROXY"]), Some("PROXY"));
+    }
+}
+
+#[cfg(test)]
+mod tun_tests {
+    use super::*;
+
+    #[test]
+    fn enable_sets_routes_without_overwriting_dns_or_custom_device() {
+        let patch = tun_patch(true);
+        assert_eq!(patch["tun"]["enable"], true);
+        assert_eq!(patch["tun"]["auto-route"], true);
+        assert_eq!(patch["tun"]["auto-detect-interface"], true);
+        assert!(patch.get("dns").is_none());
+        assert!(patch["tun"].get("dns-hijack").is_none());
+        assert!(patch["tun"].get("device").is_none());
+    }
+
+    #[test]
+    fn disable_preserves_other_settings() {
+        assert_eq!(tun_patch(false), json!({"tun": {"enable": false}}));
+    }
+}
+
+#[cfg(test)]
+mod removed_command_tests {
+    use super::*;
+    #[test]
+    fn set_mode_is_rejected_before_contacting_controller() {
+        let client = Client::new("http://127.0.0.1:1".into(), None);
+        let error = set(&client, "mode", "rule").unwrap_err().to_string();
+        assert!(error.contains("unsupported key: mode"));
     }
 }
